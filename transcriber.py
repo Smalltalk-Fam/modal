@@ -197,6 +197,7 @@ def fan_out_work(
     )
     full_text = ""
     output_segments = []
+
     for transcript, s_time in transcribe_segment.starmap(
         segment_gen, kwargs=dict(filepath=filepath, model=model)
     ):
