@@ -19,23 +19,44 @@ URL_DOWNLOADS_DIR = Path(CACHE_DIR, "url_downloads")
 MODEL_DIR = Path(CACHE_DIR, "model")
 RAW_AUDIO_DIR = Path("/mounts", "raw_audio")
 
+
+def download_models():
+    t0 = time.time()
+    import whisperx
+
+    whisperx.load_model(MODEL, device=DEVICE, compute_type="float16")
+    # TODO load more alignment models
+    whisperx.load_align_model(language_code=LANGUAGE, device=DEVICE)
+    t1 = time.time()
+    print(f"Downloaded model in {t1 - t0:.2f} seconds.")
+
+
 app_image = (
     Image.debian_slim("3.10.0")
     .apt_install("ffmpeg", "git", "curl")
     .pip_install(
-        "openai-whisper==20230314",
         "dacite==1.8.0",
-        "jiwer==2.5.1",
         "ffmpeg-python==0.2.0",
-        "pandas==1.5.3",
-        "loguru==0.6.0",
-        "torchaudio==0.13.1",
-        "openai",
-        "jupyter",
+        "git+https://github.com/kousun12/whisperx.git",
         "git+https://github.com/yt-dlp/yt-dlp.git@master",
+        "jiwer==2.5.1",
+        "jupyter",
+        "loguru==0.6.0",
+        "pandas==1.5.3",
+        "torch==2.0.0",
+        "pytorch-lightning==2.0.2",
+        "safetensors==0.3.1",
+        "torchaudio==2.0.1",
+        "openai-whisper==20230314",
+        "openai",
     )
     .run_commands("curl https://sh.rustup.rs -sSf | bash -s -- -y")
     .run_commands(". $HOME/.cargo/env && cargo install bore-cli")
+    .run_function(
+        download_models,
+        timeout=60 * 30,
+        gpu="a10g",
+    )
 )
 
 stub = Stub("fan-transcribe", image=app_image)
@@ -343,6 +364,45 @@ def make_title(from_text: str, what: str = "conversation transcription"):
     return t
 
 
+LANGUAGE = "en"
+DEVICE = "cuda"
+BATCH_SIZE = 24
+MODEL = "large-v2"
+
+
+@stub.function(
+    gpu="a10g",
+    shared_volumes={CACHE_DIR: volume},
+    timeout=60 * 10,
+)
+def transcribe_x(file_path: str, result_path: str):
+    t0 = time.time()
+    import whisperx
+
+    model = whisperx.load_model(
+        "large-v2", device=DEVICE, compute_type="float16", language=LANGUAGE
+    )
+    t1 = time.time()
+    print(f"Loaded model in {t1 - t0:.2f} seconds.")
+
+    t0 = time.time()
+    audio = whisperx.load_audio(file_path)
+    result = model.transcribe(audio, batch_size=BATCH_SIZE)
+    t1 = time.time()
+    print(f"Transcribed in {t1 - t0:.2f} seconds.")
+    full_text = ""
+    for r in result["segments"]:
+        full_text += r["text"]
+    full_text = full_text.strip()
+    result["full_text"] = full_text
+    result["model"] = MODEL
+
+    with open(result_path, "w") as f:
+        json.dump(result, f)
+
+    return result
+
+
 @stub.function(
     image=app_image,
     shared_volumes={CACHE_DIR: volume},
@@ -401,12 +461,23 @@ def start_transcribe(
         elif cfg.video_url:
             download_vid_audio(cfg.video_url, URL_DOWNLOADS_DIR / job_id)
         try:
-            result = fan_out_work(
-                result_path=result_path,
-                model=model,
-                cfg=cfg,
-                file_dir=URL_DOWNLOADS_DIR if byte_string else RAW_AUDIO_DIR,
-            )
+            file_dir = URL_DOWNLOADS_DIR if byte_string else RAW_AUDIO_DIR
+            # result = fan_out_work(
+            #     result_path=result_path,
+            #     model=model,
+            #     cfg=cfg,
+            #     file_dir=file_dir,
+            # )
+            job_source, job_id = cfg.identifier()
+
+            if cfg.url:
+                filepath = URL_DOWNLOADS_DIR / job_id
+            elif cfg.video_url:
+                filepath = URL_DOWNLOADS_DIR / f"{job_id}.mp3"
+            else:
+                file = Path(cfg.filename)
+                filepath = file_dir / file.name
+            result = transcribe_x.call(file_path=filepath, result_path=result_path)
             if summarize:
                 summary = summarize_transcript(result["full_text"])
                 result["summary"] = summary
