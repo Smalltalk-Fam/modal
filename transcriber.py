@@ -249,17 +249,33 @@ def transcribe_x(file_path: str, result_path: str):
     result = model.transcribe(audio, batch_size=BATCH_SIZE)
     t1 = time.time()
     print(f"Transcribed in {t1 - t0:.2f} seconds.")
+
+    t2 = time.time()
+    model_a, meta = whisperx.load_align_model(
+        language_code=result["language"], device=DEVICE
+    )
+    aligned = whisperx.align(
+        result["segments"],
+        model_a,
+        meta,
+        audio,
+        DEVICE,
+        return_char_alignments=False,
+    )
+
+    log.info(f"Aligned in {time.time() - t2:.2f}s")
     full_text = ""
-    for r in result["segments"]:
+    for r in aligned["segments"]:
         full_text += r["text"]
     full_text = full_text.strip()
-    result["full_text"] = full_text
-    result["model"] = MODEL
+    aligned["full_text"] = full_text
+    aligned["model"] = MODEL
+    del aligned["word_segments"]
 
     with open(result_path, "w") as f:
-        json.dump(result, f)
+        json.dump(aligned, f)
 
-    return result
+    return aligned
 
 
 @stub.function(
