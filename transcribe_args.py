@@ -20,7 +20,6 @@ class TranscribeConfig:
     force: Union[bool, None] = None
     gpu: Union[str, None] = None
     initial_prompt: Union[str, None] = None
-    new_model: Union[bool, None] = None
 
     def merge(self, other: Dict):
         return dataclasses.replace(self, **other)
