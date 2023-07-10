@@ -1,9 +1,13 @@
+import dataclasses
 import os
 import modal
-from modal import Stub, SharedVolume
+from fastapi import Header
+from modal import Stub, SharedVolume, web_endpoint, Secret
 import time
 from pathlib import Path
 import hashlib
+from urllib.parse import urlparse, urlunparse
+
 
 from from_url import cache_file
 from logger import log
@@ -30,21 +34,26 @@ image = (
     modal.Image.debian_slim("3.10.0")
     .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
     .pip_install(
-        "boto3==1.26.137",
         "Pillow==9.5.0",
-        "tqdm==4.65.0",
-        "numpy==1.24.3",
+        "boto3==1.26.137",
         "ffmpeg-python==0.2.0",
-        "opencv-python==4.7.0.72",
         "moviepy==1.0.3",
+        "numpy==1.24.3",
+        "opencv-python==4.7.0.72",
+        "requests==2.31.0",
+        "tqdm==4.65.0",
     )
     .run_commands("git clone https://github.com/google/fonts.git /gfonts")
 )
 
-stub = Stub("ss-audiogram", image=image)
+web_img = modal.Image.debian_slim("3.10.0")
+
+stub = Stub("clipit", image=image)
 sv = SharedVolume().persist("audiogram-tmp")
 
-TMP_FILES = Path("/tmp/audio")
+TMP_AUDIO = Path("/tmp/audio")
+TMP_IMG = Path("/tmp/img")
+TMP_VID = Path("/tmp/vid")
 WIDTH, HEIGHT = 1024, 1024
 FRAME_RATE = 24
 SANS_FONT_PATH = "/gfonts/apache/roboto/static/Roboto-Medium.ttf"
@@ -55,12 +64,12 @@ BG_COLOR = (0, 0, 0, 180)
 HIGHLIGHT_COLOR = (240, 215, 10, 255)
 Y_PAD = 8
 
-# Cache of cv2 images. Most of the time, we'll be re-using the same frame
-# and there generally won't be that many distinct frames in a video.
-image_cache = {}
-
 
 def resize(img, target_width: int = WIDTH, target_height: int = HEIGHT):
+    """
+    Resizes an image to fit within the target dimensions, cropping if necessary.
+    PIL.Image in, PIL.Image out.
+    """
     from PIL import Image
 
     img_ratio = img.width / img.height
@@ -79,6 +88,10 @@ def resize(img, target_width: int = WIDTH, target_height: int = HEIGHT):
 
 
 def image_for(sentence: Sentence, word_idx: int | None, img_path: str | None):
+    """
+    Returns a cv2 image with the sentence text, optionally overlaid on an image.
+    If a word_idx is provided, words up to that index will be highlighted.
+    """
     import cv2
     from PIL import Image, ImageDraw, ImageFont
     import textwrap
@@ -117,6 +130,11 @@ def image_for(sentence: Sentence, word_idx: int | None, img_path: str | None):
 
 
 def find_next_word(sentence: Sentence, cur_word: int | None):
+    """
+    Given a sentence and a current word index, returns the next word
+    that has a time stamp. If no words after cur_word have a time stamp,
+    returns the next word index.
+    """
     w_count = len(sentence["words"])
     max_word_idx = w_count - 1
     next_word_idx = 0 if cur_word is None else min(cur_word + 1, max_word_idx)
@@ -151,6 +169,7 @@ def make_video(transcript: Transcript, video_path: str, base_img: str | None):
 
     cur_sentence = 0
     cur_word = None
+    image_cache = {}
 
     for i in tqdm(range(total_frames)):
         current_time = start_time + (i / FRAME_RATE)
@@ -189,7 +208,7 @@ def combine_audio_video(
 
     t0 = time.time()
     video_clip = VideoFileClip(video_path)
-    audio = AudioFileClip(audio_path).subclip(
+    audio = AudioFileClip(str(audio_path)).subclip(
         start_time, start_time + video_clip.duration
     )
     video_clip = video_clip.set_audio(audio)
@@ -197,32 +216,100 @@ def combine_audio_video(
     log.info(f"combined audio and video in {time.time() - t0:.2f} seconds")
 
 
-@stub.function()
-def audiogram(
+@stub.function(
+    gpu="a10g",
+    secrets=[
+        Secret.from_name("aws-transcribe"),
+        Secret.from_name("aws-staging-transcoder"),
+        Secret.from_name("api-secret-key"),
+    ],
+)
+def gen_audiogram(
     transcript: Transcript,
     audio_url: str,
     write_url: str,
-    start_idx: int,
-    end_idx: int,
-    base_image: str | None = None,
-):
-    t0 = time.time()
-    selection = transcript[start_idx:end_idx]
-    audio_hash = hashlib.md5(f"{audio_url}".encode("utf-8")).hexdigest()
+    base_image_url: str = None,
+) -> str:
+    """
+    Remote entrypoint for audiogram generation. Here we download the transcript and audio from s3, then
+    generate the audiogram and upload it back to s3, under the same directory path as the transcript.
+    """
+    import requests
 
-    TMP_FILES.mkdir(parents=True, exist_ok=True)
-    audio_path = TMP_FILES / audio_hash
+    t0 = time.time()
+    selection = transcript
+
+    log.info(f"\n\nstart sample: {selection[0]['text']}\n\n")
+    audio_hash = hashlib.md5(f"{audio_url}".encode("utf-8")).hexdigest()
+    transcript_hash = hashlib.md5(f"{write_url}".encode("utf-8")).hexdigest()
+
+    TMP_AUDIO.mkdir(parents=True, exist_ok=True)
+    audio_path = TMP_AUDIO / audio_hash
     if not os.path.exists(audio_path):
         cache_file(audio_url, audio_path)
 
-    gram_hash = hashlib.md5(
-        f"{audio_url}[{start_idx}:{end_idx}]".encode("utf-8")
-    ).hexdigest()
+    gram_id = f"{transcript_hash}"
 
-    vid_path = make_video(selection, f"/tmp/{gram_hash}_silent.mp4", base_image)
+    img_path = None
+    if base_image_url:
+        TMP_IMG.mkdir(parents=True, exist_ok=True)
+        img_hash = hashlib.md5(base_image_url.encode("utf-8")).hexdigest()
+        pth = TMP_IMG / img_hash
+        cache_file(base_image_url, pth)
+        img_path = str(pth)
+
+    vid_path = make_video(selection, f"/tmp/{gram_id}_silent.mp4", img_path)
     start_time = selection[0]["start"]
-    final_path = f"/tmp/{gram_hash}.mp4"
+
+    TMP_VID.mkdir(parents=True, exist_ok=True)
+    final_path = str(TMP_VID / f"{gram_id}.mp4")
     combine_audio_video(audio_path, vid_path, start_time, final_path)
 
-    # save_s3_file(bucket, gram_key, final_path)
+    with open(final_path, "rb") as file:
+        data = file.read()
+        response = requests.put(write_url, data=data)
+        if response.status_code == 200:
+            print(f"Successfully uploaded file to {write_url}")
+        else:
+            print(f"Failed to upload file to {write_url}")
+
     log.info(f"Total time generating gram: {time.time() - t0:.2f} seconds")
+
+    ret_url = urlparse(write_url)
+    return urlunparse(ret_url._replace(query=""))
+
+
+@dataclasses.dataclass
+class APIArgs:
+    bucket: str = None
+    transcript_key: str = None
+    audio_key: str = None
+    start_idx: int = None
+    end_idx: int = None
+
+    start_word_offset: int | None = None
+    end_word_offset: int | None = None
+
+    base_image_url: Optional[str] = None
+    callback_url: Optional[str] = None
+    sync: Optional[bool] = False
+
+
+@stub.function(secret=Secret.from_name("api-secret-key"), image=web_img)
+@web_endpoint(method="POST", label="st-clipit")
+def web(api_args: APIArgs, x_modal_secret: str = Header(default=None)):
+    log.info(f"Start audiogram {api_args.bucket}/{api_args.transcript_key}")
+    log.info(f"Boundary: {api_args.start_idx} - {api_args.end_idx}")
+    secret = os.environ["API_SECRET_KEY"]
+    if secret and x_modal_secret != secret:
+        return {"error": "Not authorized"}
+    if api_args.bucket and api_args.transcript_key and api_args.audio_key:
+        if api_args.sync:
+            args = dataclasses.asdict(api_args)
+            del args["sync"]
+            url = gen_audiogram.call(**args)
+            return {"video_url": url}
+        else:
+            call = gen_audiogram.spawn(**dataclasses.asdict(api_args))
+            return {"call_id": call.object_id}
+    return {"error": "Invalid resource"}
