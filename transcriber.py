@@ -50,8 +50,6 @@ app_image = (
         "openai-whisper==20230314",
         "openai",
     )
-    .run_commands("curl https://sh.rustup.rs -sSf | bash -s -- -y")
-    .run_commands(". $HOME/.cargo/env && cargo install bore-cli")
     .run_function(
         download_models,
         timeout=60 * 30,
@@ -464,12 +462,6 @@ def start_transcribe(
             download_vid_audio(cfg.video_url, URL_DOWNLOADS_DIR / job_id)
         try:
             file_dir = URL_DOWNLOADS_DIR if byte_string else RAW_AUDIO_DIR
-            # result = fan_out_work(
-            #     result_path=result_path,
-            #     model=model,
-            #     cfg=cfg,
-            #     file_dir=file_dir,
-            # )
             job_source, job_id = cfg.identifier()
 
             if cfg.url:
@@ -479,7 +471,17 @@ def start_transcribe(
             else:
                 file = Path(cfg.filename)
                 filepath = file_dir / file.name
-            result = transcribe_x.call(file_path=filepath, result_path=result_path)
+
+            if cfg.new_model:
+                result = fan_out_work(
+                    result_path=result_path,
+                    model=model,
+                    cfg=cfg,
+                    file_dir=file_dir,
+                )
+            else:
+                result = transcribe_x.call(file_path=filepath, result_path=result_path)
+
             if summarize:
                 summary = summarize_transcript(result["full_text"])
                 result["summary"] = summary
@@ -560,42 +562,3 @@ def get_entity_bounds(text: str) -> list[tuple[int, int, str]]:
     nlp = spacy.load("en_core_web_md")
     doc = nlp(text)
     return [(ent.start_char, ent.end_char, ent.label_) for ent in doc.ents]
-
-
-@stub.function(
-    concurrency_limit=1,
-    timeout=1000,
-    shared_volumes={CACHE_DIR: volume},
-    secrets=[
-        Secret.from_name("api-secret-key"),
-        Secret.from_name("openai-secret-key"),
-        Secret.from_name("openai-org-id"),
-    ],
-)
-def run_jupyter():
-    import subprocess
-
-    jupyter_process = subprocess.Popen(
-        [
-            "jupyter",
-            "notebook",
-            "--no-browser",
-            "--allow-root",
-            "--port=8888",
-            "--NotebookApp.allow_origin='*'",
-            "--NotebookApp.allow_remote_access=1",
-        ],
-        env={**os.environ, "JUPYTER_TOKEN": os.environ["API_SECRET_KEY"] or "1234"},
-    )
-
-    bore_process = subprocess.Popen(
-        ["/root/.cargo/bin/bore", "local", "8888", "--to", "bore.pub"],
-    )
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Exiting...")
-        bore_process.kill()
-        jupyter_process.kill()

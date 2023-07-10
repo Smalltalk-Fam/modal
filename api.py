@@ -18,6 +18,7 @@ class APIArgs(BaseModel):
     llm_text: Union[str, None] = None
     callback_metadata: Union[dict, None] = None
     initial_prompt: Union[str, None] = None
+    new_model: Union[bool, None] = None
 
 
 # TODO pare down this image
@@ -42,6 +43,8 @@ def transcribe(api_args: APIArgs, x_modal_secret: str = Header(default=None)):
         overrides["filename"] = f"bytes-{int(time.time())}.mp3"
         overrides["min_segment_len"] = 0
         overrides["model"] = "tiny.en"
+    if api_args.new_model:
+        overrides["new_model"] = True
 
     if api_args.callback_url:
         results = FanTranscriber.queue(
