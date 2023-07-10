@@ -1,4 +1,4 @@
-from modal import web_endpoint, Secret, Stub, Image
+from modal import web_endpoint, Secret
 import os
 from pydantic import BaseModel
 

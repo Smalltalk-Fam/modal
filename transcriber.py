@@ -193,6 +193,8 @@ def llm_respond(text: str):
 
 
 def make_title(from_text: str, what: str = "conversation transcription"):
+    if len(from_text) == 0:
+        return ""
     log.info("Summarizing transcript")
     import openai
 
@@ -332,7 +334,12 @@ def start_transcribe(
             result = transcribe_x.call(file_path=filepath, result_path=result_path)
 
             if summarize:
-                summary = summarize_transcript(result["full_text"])
+                try:
+                    summary = summarize_transcript(result["full_text"])
+                except Exception as e:
+                    log.info("failed to summarize")
+                    log.info(e)
+                    summary = ""
                 result["summary"] = summary
                 if len(result["full_text"]) > 4000:
                     title_from = summary
@@ -340,7 +347,12 @@ def start_transcribe(
                 else:
                     title_from = result["full_text"]
                     title_type = "conversation transcription"
-                title = make_title(title_from, title_type)
+                try:
+                    title = make_title(title_from, title_type)
+                except Exception as e:
+                    log.info("failed to make title")
+                    log.info(e)
+                    title = ""
                 result["title"] = title
             if use_llm:
                 res = result["full_text"].strip()
