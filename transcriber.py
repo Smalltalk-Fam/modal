@@ -399,7 +399,7 @@ def notify_webhook(result, notify):
     # todo add a signature, signed with the secret key
     meta = notify["metadata"] or {}
     log.info(f"Sending notification to {notify['url']}, meta: {meta}")
-    requests.post(notify["url"], json={"data": result, "metadata": meta})
+    requests.post(notify["url"], json={"data": result, "metadata": meta}, verify=False)
 
 
 class FanTranscriber:
