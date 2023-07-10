@@ -58,7 +58,7 @@ app_image = (
 )
 
 stub = Stub("wx", image=app_image)
-stub.running_jobs = Dict()
+stub.running_jobs = Dict.new({})
 volume = SharedVolume().persist("fan-transcribe-volume")
 silence_end_re = re.compile(
     r" silence_end: (?P<end>[0-9]+(\.?[0-9]*)) \| silence_duration: (?P<dur>[0-9]+(\.?[0-9]*))"
