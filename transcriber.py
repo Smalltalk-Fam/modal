@@ -3,7 +3,7 @@ from modal import Secret, Stub, Image, Dict, SharedVolume, Mount
 import json
 from pathlib import Path
 import re
-from typing import Iterator, Tuple, NamedTuple
+from typing import NamedTuple
 from logger import log
 from from_url import cache_file, download_vid_audio
 import os
@@ -11,7 +11,7 @@ import requests
 import base64
 from io import BytesIO
 
-from transcribe_args import args, all_models, WhisperModel, TranscribeConfig
+from transcribe_args import args, all_models, TranscribeConfig
 
 CACHE_DIR = "/cache"
 TRANSCRIPTIONS_DIR = Path(CACHE_DIR, "transcriptions")
@@ -57,7 +57,7 @@ app_image = (
     )
 )
 
-stub = Stub("fan-transcribe", image=app_image)
+stub = Stub("wx", image=app_image)
 stub.running_jobs = Dict()
 volume = SharedVolume().persist("fan-transcribe-volume")
 silence_end_re = re.compile(
@@ -85,156 +85,6 @@ if stub.is_inside():
 else:
     mounts = create_mounts()
     gpu = args.gpu
-
-
-def split_silences(
-    filepath: str, min_segment_len, min_silence_len
-) -> Iterator[Tuple[float, float]]:
-    import ffmpeg
-
-    metadata = ffmpeg.probe(filepath)
-    duration = float(metadata["format"]["duration"])
-    if min_segment_len == 0:
-        log.info(f"No split {filepath}")
-        yield 0, duration
-        return
-    if duration < min_segment_len:
-        min_segment_len = duration
-    if duration < min_silence_len:
-        min_silence_len = duration
-
-    reader = (
-        ffmpeg.input(filepath)
-        .filter("silencedetect", n="-15dB", d=min_silence_len)
-        .output("pipe:", format="null")
-        .run_async(pipe_stderr=True)
-    )
-
-    cur_start = 0.0
-    num_segments = 0
-
-    while True:
-        line = reader.stderr.readline().decode("utf-8")
-        if not line:
-            break
-        match = silence_end_re.search(line)
-        if match:
-            silence_end, silence_dur = match.group("end"), match.group("dur")
-            split_at = float(silence_end) - (float(silence_dur) / 2)
-            if (split_at - cur_start) < min_segment_len:
-                continue
-            yield cur_start, split_at
-            cur_start = split_at
-            num_segments += 1
-
-    # ignore things if they happen after the end
-    if duration > cur_start and (duration - cur_start) > min_segment_len:
-        yield cur_start, duration
-        num_segments += 1
-    log.info(f"Split {filepath} into {num_segments} segments")
-
-
-@stub.function(
-    mounts=mounts,
-    image=app_image,
-    shared_volumes={CACHE_DIR: volume},
-    gpu=gpu,
-    cpu=None if gpu else 2,
-    keep_warm=1,
-)
-def transcribe_segment(
-    start: float,
-    end: float,
-    filepath: Path,
-    model: WhisperModel,
-):
-    import tempfile
-    import time
-    import ffmpeg
-    import torch
-    import whisper
-
-    t0 = time.time()
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
-        (
-            ffmpeg.input(str(filepath))
-            .filter("atrim", start=start, end=end)
-            .output(f.name)
-            .overwrite_output()
-            .run(quiet=True)
-        )
-
-        use_gpu = torch.cuda.is_available()
-        device = "cuda" if use_gpu else "cpu"
-        transcriber = whisper.load_model(
-            model.name, device=device, download_root=str(MODEL_DIR)
-        )
-        transcription = transcriber.transcribe(
-            f.name,
-            fp16=use_gpu,
-            temperature=0.2,
-            initial_prompt="Potentially useful vocab: Smalltalk",
-        )
-
-    t1 = time.time()
-    log.info(
-        f"Transcribed segment [{int(start)}, {int(end)}] len={end - start:.1f}s in {t1 - t0:.1f}s on {device}"
-    )
-
-    # convert back to global time
-    for segment in transcription["segments"]:
-        segment["start"] += start
-        segment["end"] += start
-        segment["entities"] = get_entity_bounds.call(segment["text"])
-
-        del segment["tokens"]
-        del segment["temperature"]
-        del segment["avg_logprob"]
-        del segment["compression_ratio"]
-        del segment["no_speech_prob"]
-
-    return transcription, start
-
-
-def fan_out_work(
-    result_path: Path,
-    model: WhisperModel,
-    cfg: TranscribeConfig,
-    file_dir: Path = RAW_AUDIO_DIR,
-):
-    job_source, job_id = cfg.identifier()
-
-    if cfg.url:
-        filepath = URL_DOWNLOADS_DIR / job_id
-    elif cfg.video_url:
-        filepath = URL_DOWNLOADS_DIR / f"{job_id}.mp3"
-    else:
-        file = Path(cfg.filename)
-        filepath = file_dir / file.name
-
-    segment_gen = split_silences(
-        str(filepath), cfg.min_segment_len, cfg.min_silence_len
-    )
-    full_text = ""
-    output_segments = []
-
-    for transcript, s_time in transcribe_segment.starmap(
-        segment_gen, kwargs=dict(filepath=filepath, model=model)
-    ):
-        full_text += transcript["text"]
-        output_segments += transcript["segments"]
-
-    transcript = {
-        "full_text": full_text.strip(),
-        "segments": output_segments,
-        "model": model.name,
-    }
-    with open(result_path, "w") as f:
-        json.dump(transcript, f, indent=2)
-    log.info(f"Wrote transcription to remote volume: {result_path}")
-
-    return transcript
 
 
 def summarize_transcript(text: str):
@@ -380,7 +230,14 @@ def transcribe_x(file_path: str, result_path: str):
     import whisperx
 
     model = whisperx.load_model(
-        "large-v2", device=DEVICE, compute_type="float16", language=LANGUAGE
+        "large-v2",
+        device=DEVICE,
+        compute_type="float16",
+        language=LANGUAGE,
+        asr_options={
+            "initial_prompt": "A conversation on Smalltalk",
+            "compression_ratio_threshold": 2,
+        },
     )
     t1 = time.time()
     print(f"Loaded model in {t1 - t0:.2f} seconds.")
@@ -472,15 +329,7 @@ def start_transcribe(
                 file = Path(cfg.filename)
                 filepath = file_dir / file.name
 
-            if cfg.new_model:
-                result = fan_out_work(
-                    result_path=result_path,
-                    model=model,
-                    cfg=cfg,
-                    file_dir=file_dir,
-                )
-            else:
-                result = transcribe_x.call(file_path=filepath, result_path=result_path)
+            result = transcribe_x.call(file_path=filepath, result_path=result_path)
 
             if summarize:
                 summary = summarize_transcript(result["full_text"])
