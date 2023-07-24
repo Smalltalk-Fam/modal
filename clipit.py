@@ -1,18 +1,16 @@
 import dataclasses
 import os
+
 import modal
-from fastapi import Header
-from modal import Stub, SharedVolume, web_endpoint, Secret
+from typing import TypedDict, List, Optional
+from modal import Stub, Secret, web_endpoint, Mount, NetworkFileSystem
 import time
 from pathlib import Path
 import hashlib
-from urllib.parse import urlparse, urlunparse
+from fastapi import Header
 
-
-from from_url import cache_file
+from network import get_s3_json, save_s3_file, save_file, put_s3, notify_callback
 from logger import log
-
-from typing import TypedDict, List, Optional
 
 
 class Word(TypedDict):
@@ -30,6 +28,7 @@ class Sentence(TypedDict):
 
 
 Transcript = List[Sentence]
+
 image = (
     modal.Image.debian_slim("3.10.0")
     .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
@@ -45,19 +44,23 @@ image = (
     )
     .run_commands("git clone https://github.com/google/fonts.git /gfonts")
 )
-
 web_img = modal.Image.debian_slim("3.10.0")
 
-stub = Stub("clipit", image=image)
-sv = SharedVolume().persist("audiogram-tmp")
+stub = Stub("st-clipit", image=image)
+sv = NetworkFileSystem.persisted("clipit-tmp")
 
+BUCKET = "talk-clips"
+RECORDINGS_BUCKET = "talk-recordings"
+dir_path = os.path.dirname(os.path.realpath(__file__))
 TMP_AUDIO = Path("/tmp/audio")
 TMP_IMG = Path("/tmp/img")
 TMP_VID = Path("/tmp/vid")
+MNT_STATIC = Path("/tmp/assets")
 WIDTH, HEIGHT = 1024, 1024
 FRAME_RATE = 24
-SANS_FONT_PATH = "/gfonts/apache/roboto/static/Roboto-Medium.ttf"
-FONT_PATH = "/gfonts/ofl/merriweather/Merriweather-Regular.ttf"
+SANS_FONT_PATH = str(MNT_STATIC / "GT-Flexa-Standard-Medium.ttf")
+MONO_FONT_PATH = "/gfonts/apache/robotomono/RobotoMono[wght].ttf"
+SERIF_FONT_PATH = "/gfonts/ofl/spectral/Spectral-Medium.ttf"
 FONT_SIZE = 48
 TEXT_COLOR = (255, 255, 255, 225)
 BG_COLOR = (0, 0, 0, 180)
@@ -67,7 +70,7 @@ Y_PAD = 8
 
 def resize(img, target_width: int = WIDTH, target_height: int = HEIGHT):
     """
-    Resizes an image to fit within the target dimensions, cropping if necessary.
+    Resizes an image to fit within the target dimensions, cropping if necessary
     PIL.Image in, PIL.Image out.
     """
     from PIL import Image
@@ -89,7 +92,7 @@ def resize(img, target_width: int = WIDTH, target_height: int = HEIGHT):
 
 def image_for(sentence: Sentence, word_idx: int | None, img_path: str | None):
     """
-    Returns a cv2 image with the sentence text, optionally overlaid on an image.
+    Returns a cv2 image with the sentence text, optionally overlaid on an image
     If a word_idx is provided, words up to that index will be highlighted.
     """
     import cv2
@@ -101,7 +104,7 @@ def image_for(sentence: Sentence, word_idx: int | None, img_path: str | None):
     draw = ImageDraw.Draw(img)
 
     lines = textwrap.wrap(sentence["text"], width=38)
-    font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+    font = ImageFont.truetype(SANS_FONT_PATH, FONT_SIZE)
     y_pos = HEIGHT // 2 - (len(lines) // 2 * (FONT_SIZE + Y_PAD))
 
     wi = 0
@@ -149,11 +152,59 @@ def find_next_word(sentence: Sentence, cur_word: int | None):
     return next_word_idx
 
 
+def cut_video(transcript: Transcript, media_path: str, write_path: str):
+    from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+    from moviepy.video.VideoClip import ImageClip
+    from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+
+    t0 = time.time()
+    start_time = transcript[0]["start"]
+    end_time = transcript[-1]["end"]
+
+    icon_size = 75
+    icon_padding = 56
+    icon = ImageClip(str(MNT_STATIC / "logo.png"))
+    icon = icon.resize(height=icon_size)
+    icon = icon.set_opacity(0.85)
+
+    clip = VideoFileClip(media_path)
+    clip = clip.subclip(start_time, end_time)
+
+    aspect_ratio = clip.size[0] / clip.size[1]
+
+    if aspect_ratio >= 1:
+        clip = clip.resize(width=WIDTH)
+    else:
+        clip = clip.resize(height=HEIGHT)
+
+    icon = icon.set_duration(clip.duration)
+    icon = icon.set_position((WIDTH - icon_size - icon_padding, icon_padding))
+    clip = CompositeVideoClip([clip, icon])
+
+    last_frame_time = clip.duration - 0.1
+    last_frame = clip.subclip(last_frame_time, clip.duration).set_duration(0.5)
+    last_frame = last_frame.set_audio(None)
+    last_frame = last_frame.crossfadeout(0.5)
+
+    # bumper_audio = AudioFileClip(str(MNT_STATIC / "bumper_audio.aif"))
+    #
+    # bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
+    # bumper_centered = CompositeVideoClip(
+    #     [bumper.set_position("center")], size=clip.size
+    # )
+    # bumper_centered = bumper_centered.set_audio(bumper_audio)
+
+    final_clip = concatenate_videoclips([clip, last_frame])  # todo add bumper
+    final_clip.write_videofile(write_path)
+
+    log.info(f"Cut video in {time.time() - t0:.2f} seconds")
+
+
 def make_video(transcript: Transcript, video_path: str, base_img: str | None):
     """
-    The main function. Will take in a series of sentence/phrases, and go frame-by-frame
-    to generate a video with the text, optionally overlaying it on an image. Output video
-    will be silent.
+    The main function. Will take in a series of sentence/phrases, and go
+    frame-by-frame to generate a video with the text, optionally overlaying it
+    on an image. Output video will be silent.
     """
     import cv2
     from tqdm import tqdm
@@ -200,116 +251,163 @@ def make_video(transcript: Transcript, video_path: str, base_img: str | None):
 def combine_audio_video(
     audio_path: str | Path, video_path: str, start_time: float, write_path: str
 ):
-    """
-    Given the audio file that the transcript came from, combine that subclip
-    with the generated audiogram.
-    """
-    from moviepy.editor import VideoFileClip, AudioFileClip
+    from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+    from moviepy.video.VideoClip import ImageClip
+    from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 
     t0 = time.time()
+
+    icon_size = 75
+    icon_padding = 56
+    icon = ImageClip(str(MNT_STATIC / "logo.png"))
+    icon = icon.resize(height=icon_size)
+    icon = icon.set_opacity(0.85)
+
     video_clip = VideoFileClip(video_path)
+    icon = icon.set_duration(video_clip.duration)
+    icon = icon.set_position((WIDTH - icon_size - icon_padding, icon_padding))
+
+    video_clip = CompositeVideoClip([video_clip, icon])
+
     audio = AudioFileClip(str(audio_path)).subclip(
         start_time, start_time + video_clip.duration
     )
     video_clip = video_clip.set_audio(audio)
-    video_clip.write_videofile(write_path)
+
+    last_frame_time = video_clip.duration - 0.1
+    last_frame = video_clip.subclip(last_frame_time, video_clip.duration).set_duration(
+        0.5
+    )
+    last_frame = last_frame.set_audio(None)
+    last_frame = last_frame.crossfadeout(0.5)
+
+    # bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
+    # bumper = bumper.crossfadein(0.5)
+    # bumper_audio = AudioFileClip(str(MNT_STATIC / "bumper_audio.aif"))
+    # bumper = bumper.set_audio(bumper_audio)
+    final_clip = concatenate_videoclips([video_clip, last_frame])  # todo add bumper
+    final_clip.write_videofile(write_path)
+
     log.info(f"combined audio and video in {time.time() - t0:.2f} seconds")
 
 
 @stub.function(
-    gpu="a10g",
     secrets=[
-        Secret.from_name("aws-transcribe"),
-        Secret.from_name("aws-staging-transcoder"),
+        Secret.from_name("aws-clip-manager"),
         Secret.from_name("api-secret-key"),
     ],
+    mounts=[
+        Mount.from_local_dir(
+            local_path=os.path.join(dir_path, "assets"),
+            remote_path=str(MNT_STATIC),
+        ),
+    ],
 )
-def gen_audiogram(
-    transcript: Transcript,
-    audio_url: str,
-    write_url: str,
-    base_image_url: str = None,
+def gen_clip(
+    clip_id: str,
+    transcript_key: str,
+    start_idx: int,
+    end_idx: int,
+    audio_key: str = None,
+    video_key: str = None,
+    start_word_offset: Optional[int] = None,
+    end_word_offset: Optional[int] = None,
+    base_image_url: Optional[str] = None,
+    callback_url: Optional[str] = None,
 ) -> str:
-    """
-    Remote entrypoint for audiogram generation. Here we download the transcript and audio from s3, then
-    generate the audiogram and upload it back to s3, under the same directory path as the transcript.
-    """
-    import requests
-
     t0 = time.time()
-    selection = transcript
+    transcript = get_s3_json(BUCKET, transcript_key)
+    selection = transcript[start_idx : end_idx + 1]
+    if start_word_offset and start_word_offset > 0:
+        words = selection[0]["words"][start_word_offset:]
+        # find first word with a start and set start
+        start = next(w["start"] for w in words if w.get("start"))
+        end = selection[0]["end"]
+        text = " ".join([w["text"] for w in words])
+        selection[0] = {"start": start, "end": end, "text": text, "words": words}
+    if end_word_offset and end_word_offset > 0:
+        words = selection[-1]["words"][:-end_word_offset]
+        # find last word with an end and set end
+        end = next(w["end"] for w in reversed(words) if w.get("end"))
+        start = selection[-1]["start"]
+        text = " ".join([w["text"] for w in words])
+        selection[-1] = {"start": start, "end": end, "text": text, "words": words}
 
     log.info(f"\n\nstart sample: {selection[0]['text']}\n\n")
-    audio_hash = hashlib.md5(f"{audio_url}".encode("utf-8")).hexdigest()
-    transcript_hash = hashlib.md5(f"{write_url}".encode("utf-8")).hexdigest()
+    media_key = audio_key or video_key
+    media_hash = hashlib.md5(
+        f"{RECORDINGS_BUCKET}/{media_key}".encode("utf-8")
+    ).hexdigest()
 
     TMP_AUDIO.mkdir(parents=True, exist_ok=True)
-    audio_path = TMP_AUDIO / audio_hash
-    if not os.path.exists(audio_path):
-        cache_file(audio_url, audio_path)
+    media_path = TMP_AUDIO / media_hash
 
-    gram_id = f"{transcript_hash}"
+    if not os.path.exists(media_path):
+        save_s3_file(RECORDINGS_BUCKET, media_key, media_path)
 
-    img_path = None
+    img_path = str(MNT_STATIC / "default_bg.png")
     if base_image_url:
         TMP_IMG.mkdir(parents=True, exist_ok=True)
         img_hash = hashlib.md5(base_image_url.encode("utf-8")).hexdigest()
         pth = TMP_IMG / img_hash
-        cache_file(base_image_url, pth)
+        save_file(base_image_url, pth)
         img_path = str(pth)
 
-    vid_path = make_video(selection, f"/tmp/{gram_id}_silent.mp4", img_path)
-    start_time = selection[0]["start"]
-
     TMP_VID.mkdir(parents=True, exist_ok=True)
-    final_path = str(TMP_VID / f"{gram_id}.mp4")
-    combine_audio_video(audio_path, vid_path, start_time, final_path)
+    final_path = str(TMP_VID / f"{clip_id}.mp4")
+
+    if audio_key:
+        silent_vid_path = make_video(selection, f"/tmp/{clip_id}_silent.mp4", img_path)
+        start_time = selection[0]["start"]
+        combine_audio_video(media_path, silent_vid_path, start_time, final_path)
+    elif video_key:
+        cut_video(selection, str(media_path), final_path)
 
     with open(final_path, "rb") as file:
         data = file.read()
-        response = requests.put(write_url, data=data)
-        if response.status_code == 200:
-            print(f"Successfully uploaded file to {write_url}")
-        else:
-            print(f"Failed to upload file to {write_url}")
-
+        prefix = os.path.dirname(transcript_key).replace("transcriptions/", "clips/")
+        out_file_key = f"{prefix}/{clip_id}.mp4"
+        put_s3(BUCKET, out_file_key, data)
     log.info(f"Total time generating gram: {time.time() - t0:.2f} seconds")
-
-    ret_url = urlparse(write_url)
-    return urlunparse(ret_url._replace(query=""))
+    if callback_url:
+        body = {"file_key": out_file_key}
+        notify_callback(callback_url, body)
+    return out_file_key
 
 
 @dataclasses.dataclass
 class APIArgs:
-    bucket: str = None
+    clip_id: str = None
     transcript_key: str = None
-    audio_key: str = None
-    start_idx: int = None
-    end_idx: int = None
+    start_idx: Optional[int] = None
+    end_idx: Optional[int] = None
 
     start_word_offset: int | None = None
     end_word_offset: int | None = None
 
+    audio_key: Optional[str] = None
+    video_key: Optional[str] = None
     base_image_url: Optional[str] = None
     callback_url: Optional[str] = None
     sync: Optional[bool] = False
 
 
 @stub.function(secret=Secret.from_name("api-secret-key"), image=web_img)
-@web_endpoint(method="POST", label="st-clipit")
+@web_endpoint(method="POST", label="clipit")
 def web(api_args: APIArgs, x_modal_secret: str = Header(default=None)):
-    log.info(f"Start audiogram {api_args.bucket}/{api_args.transcript_key}")
+    log.info(f"Start clip {api_args.transcript_key}")
     log.info(f"Boundary: {api_args.start_idx} - {api_args.end_idx}")
     secret = os.environ["API_SECRET_KEY"]
     if secret and x_modal_secret != secret:
         return {"error": "Not authorized"}
-    if api_args.bucket and api_args.transcript_key and api_args.audio_key:
+    has_media = api_args.audio_key or api_args.video_key
+    if api_args.clip_id and api_args.transcript_key and has_media:
         if api_args.sync:
             args = dataclasses.asdict(api_args)
             del args["sync"]
-            url = gen_audiogram.call(**args)
-            return {"video_url": url}
+            key = gen_clip.call(**args)
+            return {"file_key": key}
         else:
-            call = gen_audiogram.spawn(**dataclasses.asdict(api_args))
+            call = gen_clip.spawn(**dataclasses.asdict(api_args))
             return {"call_id": call.object_id}
     return {"error": "Invalid resource"}

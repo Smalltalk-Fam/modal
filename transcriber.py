@@ -1,13 +1,12 @@
 import time
-from modal import Secret, Stub, Image, Dict, SharedVolume, Mount
+from modal import Secret, Stub, Image, Dict, Mount, NetworkFileSystem
 import json
 from pathlib import Path
 import re
 from typing import NamedTuple
 from logger import log
-from from_url import cache_file, download_vid_audio
+from network import save_file, download_vid_audio, notify_callback, put_s3
 import os
-import requests
 import base64
 from io import BytesIO
 
@@ -55,11 +54,13 @@ app_image = (
         timeout=60 * 30,
         gpu="a10g",
     )
+    .pip_install("boto3==1.26.137")
 )
 
 stub = Stub("wx", image=app_image)
 stub.running_jobs = Dict.new({})
-volume = SharedVolume().persist("fan-transcribe-volume")
+
+volume = NetworkFileSystem.persisted("fan-transcribe-volume")
 silence_end_re = re.compile(
     r" silence_end: (?P<end>[0-9]+(\.?[0-9]*)) \| silence_duration: (?P<dur>[0-9]+(\.?[0-9]*))"
 )
@@ -224,10 +225,10 @@ MODEL = "large-v2"
 
 @stub.function(
     gpu="a10g",
-    shared_volumes={CACHE_DIR: volume},
+    network_file_systems={CACHE_DIR: volume},
     timeout=60 * 10,
 )
-def transcribe_x(file_path: str, result_path: str):
+def transcribe_x(file_path: str, result_path: str, skip_align: bool = False):
     t0 = time.time()
     import whisperx
 
@@ -254,14 +255,17 @@ def transcribe_x(file_path: str, result_path: str):
     model_a, meta = whisperx.load_align_model(
         language_code=result["language"], device=DEVICE
     )
-    aligned = whisperx.align(
-        result["segments"],
-        model_a,
-        meta,
-        audio,
-        DEVICE,
-        return_char_alignments=False,
-    )
+    if skip_align:
+        aligned = result
+    else:
+        aligned = whisperx.align(
+            result["segments"],
+            model_a,
+            meta,
+            audio,
+            DEVICE,
+            return_char_alignments=False,
+        )
 
     log.info(f"Aligned in {time.time() - t2:.2f}s")
     full_text = ""
@@ -270,7 +274,10 @@ def transcribe_x(file_path: str, result_path: str):
     full_text = full_text.strip()
     aligned["full_text"] = full_text
     aligned["model"] = MODEL
-    del aligned["word_segments"]
+    try:
+        del aligned["word_segments"]
+    except KeyError:
+        print("no word segments")
 
     with open(result_path, "w") as f:
         json.dump(aligned, f)
@@ -280,11 +287,13 @@ def transcribe_x(file_path: str, result_path: str):
 
 @stub.function(
     image=app_image,
-    shared_volumes={CACHE_DIR: volume},
+    network_file_systems={CACHE_DIR: volume},
     timeout=60 * 12,
     secrets=[
         Secret.from_name("openai-secret-key"),
         Secret.from_name("openai-org-id"),
+        Secret.from_name("aws-clip-manager"),
+        Secret.from_name("api-secret-key"),
     ],
     keep_warm=1,
 )
@@ -332,7 +341,7 @@ def start_transcribe(
             model=model.name, start_time=int(time.time()), source=job_source
         )
         if cfg.url:
-            cache_file(cfg.url, URL_DOWNLOADS_DIR / job_id)
+            save_file(cfg.url, URL_DOWNLOADS_DIR / job_id)
         elif cfg.video_url:
             download_vid_audio(cfg.video_url, URL_DOWNLOADS_DIR / job_id)
         try:
@@ -347,7 +356,20 @@ def start_transcribe(
                 file = Path(cfg.filename)
                 filepath = file_dir / file.name
 
-            result = transcribe_x.call(file_path=filepath, result_path=result_path)
+            result = transcribe_x.call(
+                file_path=filepath,
+                result_path=result_path,
+                skip_align=bool(byte_string),
+            )
+            recording_id = notify.get("metadata") and notify["metadata"].get(
+                "recording_id"
+            )
+            if recording_id:
+                put_s3(
+                    "talk-clips",
+                    f"transcriptions/{recording_id}/aligned.json",
+                    json.dumps(result),
+                )
 
             if summarize:
                 try:
@@ -396,10 +418,8 @@ def start_transcribe(
 
 
 def notify_webhook(result, notify):
-    # todo add a signature, signed with the secret key
     meta = notify["metadata"] or {}
-    log.info(f"Sending notification to {notify['url']}, meta: {meta}")
-    requests.post(notify["url"], json={"data": result, "metadata": meta}, verify=False)
+    notify_callback(notify["url"], {"data": result, "metadata": meta})
 
 
 class FanTranscriber:
