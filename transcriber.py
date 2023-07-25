@@ -1,17 +1,16 @@
 import time
-from modal import Secret, Stub, Image, Dict, SharedVolume, Mount
+from modal import Secret, Stub, Image, Dict, Mount, NetworkFileSystem
 import json
 from pathlib import Path
 import re
-from typing import Iterator, Tuple, NamedTuple
+from typing import NamedTuple
 from logger import log
-from from_url import cache_file, download_vid_audio
+from network import save_file, download_vid_audio, notify_callback, put_s3
 import os
-import requests
 import base64
 from io import BytesIO
 
-from transcribe_args import args, all_models, WhisperModel, TranscribeConfig
+from transcribe_args import args, all_models, TranscribeConfig
 
 CACHE_DIR = "/cache"
 TRANSCRIPTIONS_DIR = Path(CACHE_DIR, "transcriptions")
@@ -19,28 +18,49 @@ URL_DOWNLOADS_DIR = Path(CACHE_DIR, "url_downloads")
 MODEL_DIR = Path(CACHE_DIR, "model")
 RAW_AUDIO_DIR = Path("/mounts", "raw_audio")
 
+
+def download_models():
+    t0 = time.time()
+    import whisperx
+
+    whisperx.load_model(MODEL, device=DEVICE, compute_type="float16")
+    # TODO load more alignment models
+    whisperx.load_align_model(language_code=LANGUAGE, device=DEVICE)
+    t1 = time.time()
+    print(f"Downloaded model in {t1 - t0:.2f} seconds.")
+
+
 app_image = (
     Image.debian_slim("3.10.0")
     .apt_install("ffmpeg", "git", "curl")
     .pip_install(
-        "openai-whisper==20230314",
         "dacite==1.8.0",
-        "jiwer==2.5.1",
         "ffmpeg-python==0.2.0",
-        "pandas==1.5.3",
-        "loguru==0.6.0",
-        "torchaudio==0.13.1",
-        "openai",
-        "jupyter",
+        "git+https://github.com/kousun12/whisperx.git",
         "git+https://github.com/yt-dlp/yt-dlp.git@master",
+        "jiwer==2.5.1",
+        "jupyter",
+        "loguru==0.6.0",
+        "pandas==1.5.3",
+        "torch==2.0.0",
+        "pytorch-lightning==2.0.2",
+        "safetensors==0.3.1",
+        "torchaudio==2.0.1",
+        "openai-whisper==20230314",
+        "openai",
     )
-    .run_commands("curl https://sh.rustup.rs -sSf | bash -s -- -y")
-    .run_commands(". $HOME/.cargo/env && cargo install bore-cli")
+    .run_function(
+        download_models,
+        timeout=60 * 30,
+        gpu="a10g",
+    )
+    .pip_install("boto3==1.26.137")
 )
 
-stub = Stub("fan-transcribe", image=app_image)
-stub.running_jobs = Dict()
-volume = SharedVolume().persist("fan-transcribe-volume")
+stub = Stub("wx", image=app_image)
+stub.running_jobs = Dict.new({})
+
+volume = NetworkFileSystem.persisted("fan-transcribe-volume")
 silence_end_re = re.compile(
     r" silence_end: (?P<end>[0-9]+(\.?[0-9]*)) \| silence_duration: (?P<dur>[0-9]+(\.?[0-9]*))"
 )
@@ -66,155 +86,6 @@ if stub.is_inside():
 else:
     mounts = create_mounts()
     gpu = args.gpu
-
-
-def split_silences(
-    filepath: str, min_segment_len, min_silence_len
-) -> Iterator[Tuple[float, float]]:
-    import ffmpeg
-
-    metadata = ffmpeg.probe(filepath)
-    duration = float(metadata["format"]["duration"])
-    if min_segment_len == 0:
-        log.info(f"No split {filepath}")
-        yield 0, duration
-        return
-    if duration < min_segment_len:
-        min_segment_len = duration
-    if duration < min_silence_len:
-        min_silence_len = duration
-
-    reader = (
-        ffmpeg.input(filepath)
-        .filter("silencedetect", n="-15dB", d=min_silence_len)
-        .output("pipe:", format="null")
-        .run_async(pipe_stderr=True)
-    )
-
-    cur_start = 0.0
-    num_segments = 0
-
-    while True:
-        line = reader.stderr.readline().decode("utf-8")
-        if not line:
-            break
-        match = silence_end_re.search(line)
-        if match:
-            silence_end, silence_dur = match.group("end"), match.group("dur")
-            split_at = float(silence_end) - (float(silence_dur) / 2)
-            if (split_at - cur_start) < min_segment_len:
-                continue
-            yield cur_start, split_at
-            cur_start = split_at
-            num_segments += 1
-
-    # ignore things if they happen after the end
-    if duration > cur_start and (duration - cur_start) > min_segment_len:
-        yield cur_start, duration
-        num_segments += 1
-    log.info(f"Split {filepath} into {num_segments} segments")
-
-
-@stub.function(
-    mounts=mounts,
-    image=app_image,
-    shared_volumes={CACHE_DIR: volume},
-    gpu=gpu,
-    cpu=None if gpu else 2,
-    keep_warm=1,
-)
-def transcribe_segment(
-    start: float,
-    end: float,
-    filepath: Path,
-    model: WhisperModel,
-):
-    import tempfile
-    import time
-    import ffmpeg
-    import torch
-    import whisper
-
-    t0 = time.time()
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
-        (
-            ffmpeg.input(str(filepath))
-            .filter("atrim", start=start, end=end)
-            .output(f.name)
-            .overwrite_output()
-            .run(quiet=True)
-        )
-
-        use_gpu = torch.cuda.is_available()
-        device = "cuda" if use_gpu else "cpu"
-        transcriber = whisper.load_model(
-            model.name, device=device, download_root=str(MODEL_DIR)
-        )
-        transcription = transcriber.transcribe(
-            f.name,
-            fp16=use_gpu,
-            temperature=0.2,
-            initial_prompt="Potentially useful vocab: Smalltalk",
-        )
-
-    t1 = time.time()
-    log.info(
-        f"Transcribed segment [{int(start)}, {int(end)}] len={end - start:.1f}s in {t1 - t0:.1f}s on {device}"
-    )
-
-    # convert back to global time
-    for segment in transcription["segments"]:
-        segment["start"] += start
-        segment["end"] += start
-        segment["entities"] = get_entity_bounds.call(segment["text"])
-
-        del segment["tokens"]
-        del segment["temperature"]
-        del segment["avg_logprob"]
-        del segment["compression_ratio"]
-        del segment["no_speech_prob"]
-
-    return transcription, start
-
-
-def fan_out_work(
-    result_path: Path,
-    model: WhisperModel,
-    cfg: TranscribeConfig,
-    file_dir: Path = RAW_AUDIO_DIR,
-):
-    job_source, job_id = cfg.identifier()
-
-    if cfg.url:
-        filepath = URL_DOWNLOADS_DIR / job_id
-    elif cfg.video_url:
-        filepath = URL_DOWNLOADS_DIR / f"{job_id}.mp3"
-    else:
-        file = Path(cfg.filename)
-        filepath = file_dir / file.name
-
-    segment_gen = split_silences(
-        str(filepath), cfg.min_segment_len, cfg.min_silence_len
-    )
-    full_text = ""
-    output_segments = []
-    for transcript, s_time in transcribe_segment.starmap(
-        segment_gen, kwargs=dict(filepath=filepath, model=model)
-    ):
-        full_text += transcript["text"]
-        output_segments += transcript["segments"]
-
-    transcript = {
-        "full_text": full_text.strip(),
-        "segments": output_segments,
-        "model": model.name,
-    }
-    with open(result_path, "w") as f:
-        json.dump(transcript, f, indent=2)
-    log.info(f"Wrote transcription to remote volume: {result_path}")
-
-    return transcript
 
 
 def summarize_transcript(text: str):
@@ -323,6 +194,8 @@ def llm_respond(text: str):
 
 
 def make_title(from_text: str, what: str = "conversation transcription"):
+    if len(from_text) == 0:
+        return ""
     log.info("Summarizing transcript")
     import openai
 
@@ -344,13 +217,83 @@ def make_title(from_text: str, what: str = "conversation transcription"):
     return t
 
 
+LANGUAGE = "en"
+DEVICE = "cuda"
+BATCH_SIZE = 24
+MODEL = "large-v2"
+
+
+@stub.function(
+    gpu="a10g",
+    network_file_systems={CACHE_DIR: volume},
+    timeout=60 * 10,
+)
+def transcribe_x(file_path: str, result_path: str, skip_align: bool = False):
+    t0 = time.time()
+    import whisperx
+
+    model = whisperx.load_model(
+        "large-v2",
+        device=DEVICE,
+        compute_type="float16",
+        language=LANGUAGE,
+        asr_options={
+            "initial_prompt": "A conversation on Smalltalk",
+            "compression_ratio_threshold": 2,
+        },
+    )
+    t1 = time.time()
+    print(f"Loaded model in {t1 - t0:.2f} seconds.")
+
+    t0 = time.time()
+    audio = whisperx.load_audio(file_path)
+    result = model.transcribe(audio, batch_size=BATCH_SIZE)
+    t1 = time.time()
+    print(f"Transcribed in {t1 - t0:.2f} seconds.")
+
+    t2 = time.time()
+    model_a, meta = whisperx.load_align_model(
+        language_code=result["language"], device=DEVICE
+    )
+    if skip_align:
+        aligned = result
+    else:
+        aligned = whisperx.align(
+            result["segments"],
+            model_a,
+            meta,
+            audio,
+            DEVICE,
+            return_char_alignments=False,
+        )
+
+    log.info(f"Aligned in {time.time() - t2:.2f}s")
+    full_text = ""
+    for r in aligned["segments"]:
+        full_text += r["text"]
+    full_text = full_text.strip()
+    aligned["full_text"] = full_text
+    aligned["model"] = MODEL
+    try:
+        del aligned["word_segments"]
+    except KeyError:
+        print("no word segments")
+
+    with open(result_path, "w") as f:
+        json.dump(aligned, f)
+
+    return aligned
+
+
 @stub.function(
     image=app_image,
-    shared_volumes={CACHE_DIR: volume},
+    network_file_systems={CACHE_DIR: volume},
     timeout=60 * 12,
     secrets=[
         Secret.from_name("openai-secret-key"),
         Secret.from_name("openai-org-id"),
+        Secret.from_name("aws-clip-manager"),
+        Secret.from_name("api-secret-key"),
     ],
     keep_warm=1,
 )
@@ -398,18 +341,43 @@ def start_transcribe(
             model=model.name, start_time=int(time.time()), source=job_source
         )
         if cfg.url:
-            cache_file(cfg.url, URL_DOWNLOADS_DIR / job_id)
+            save_file(cfg.url, URL_DOWNLOADS_DIR / job_id)
         elif cfg.video_url:
             download_vid_audio(cfg.video_url, URL_DOWNLOADS_DIR / job_id)
         try:
-            result = fan_out_work(
+            file_dir = URL_DOWNLOADS_DIR if byte_string else RAW_AUDIO_DIR
+            job_source, job_id = cfg.identifier()
+
+            if cfg.url:
+                filepath = URL_DOWNLOADS_DIR / job_id
+            elif cfg.video_url:
+                filepath = URL_DOWNLOADS_DIR / f"{job_id}.mp3"
+            else:
+                file = Path(cfg.filename)
+                filepath = file_dir / file.name
+
+            result = transcribe_x.call(
+                file_path=filepath,
                 result_path=result_path,
-                model=model,
-                cfg=cfg,
-                file_dir=URL_DOWNLOADS_DIR if byte_string else RAW_AUDIO_DIR,
+                skip_align=bool(byte_string),
             )
+            recording_id = notify.get("metadata") and notify["metadata"].get(
+                "recording_id"
+            )
+            if recording_id:
+                put_s3(
+                    "talk-clips",
+                    f"transcriptions/{recording_id}/aligned.json",
+                    json.dumps(result),
+                )
+
             if summarize:
-                summary = summarize_transcript(result["full_text"])
+                try:
+                    summary = summarize_transcript(result["full_text"])
+                except Exception as e:
+                    log.info("failed to summarize")
+                    log.info(e)
+                    summary = ""
                 result["summary"] = summary
                 if len(result["full_text"]) > 4000:
                     title_from = summary
@@ -417,7 +385,12 @@ def start_transcribe(
                 else:
                     title_from = result["full_text"]
                     title_type = "conversation transcription"
-                title = make_title(title_from, title_type)
+                try:
+                    title = make_title(title_from, title_type)
+                except Exception as e:
+                    log.info("failed to make title")
+                    log.info(e)
+                    title = ""
                 result["title"] = title
             if use_llm:
                 res = result["full_text"].strip()
@@ -445,10 +418,8 @@ def start_transcribe(
 
 
 def notify_webhook(result, notify):
-    # todo add a signature, signed with the secret key
     meta = notify["metadata"] or {}
-    log.info(f"Sending notification to {notify['url']}, meta: {meta}")
-    requests.post(notify["url"], json={"data": result, "metadata": meta})
+    notify_callback(notify["url"], {"data": result, "metadata": meta})
 
 
 class FanTranscriber:
@@ -488,42 +459,3 @@ def get_entity_bounds(text: str) -> list[tuple[int, int, str]]:
     nlp = spacy.load("en_core_web_md")
     doc = nlp(text)
     return [(ent.start_char, ent.end_char, ent.label_) for ent in doc.ents]
-
-
-@stub.function(
-    concurrency_limit=1,
-    timeout=1000,
-    shared_volumes={CACHE_DIR: volume},
-    secrets=[
-        Secret.from_name("api-secret-key"),
-        Secret.from_name("openai-secret-key"),
-        Secret.from_name("openai-org-id"),
-    ],
-)
-def run_jupyter():
-    import subprocess
-
-    jupyter_process = subprocess.Popen(
-        [
-            "jupyter",
-            "notebook",
-            "--no-browser",
-            "--allow-root",
-            "--port=8888",
-            "--NotebookApp.allow_origin='*'",
-            "--NotebookApp.allow_remote_access=1",
-        ],
-        env={**os.environ, "JUPYTER_TOKEN": os.environ["API_SECRET_KEY"] or "1234"},
-    )
-
-    bore_process = subprocess.Popen(
-        ["/root/.cargo/bin/bore", "local", "8888", "--to", "bore.pub"],
-    )
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Exiting...")
-        bore_process.kill()
-        jupyter_process.kill()
