@@ -62,7 +62,7 @@ all_models = {
     "large-v2": WhisperModel(name="large-v2", params="1550M"),
 }
 
-DEFAULT_MODEL = all_models["base.en"]
+DEFAULT_MODEL = all_models["large-v2"]
 
 DEFAULT_ARGS = TranscribeConfig(
     url=None,
@@ -79,7 +79,7 @@ WEB_DEFAULT_ARGS = TranscribeConfig(
     video_url=None,
     filename=None,
     out=None,
-    model=all_models["base"].name,
+    model=all_models["large-v2"].name,
     min_segment_len=3.2,
     min_silence_len=1.5,
 )

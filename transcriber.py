@@ -10,13 +10,17 @@ import os
 import base64
 from io import BytesIO
 
-from transcribe_args import args, all_models, TranscribeConfig
+from transcribe_args import args, TranscribeConfig
 
 CACHE_DIR = "/cache"
 TRANSCRIPTIONS_DIR = Path(CACHE_DIR, "transcriptions")
 URL_DOWNLOADS_DIR = Path(CACHE_DIR, "url_downloads")
-MODEL_DIR = Path(CACHE_DIR, "model")
 RAW_AUDIO_DIR = Path("/mounts", "raw_audio")
+
+LANGUAGE = "en"
+DEVICE = "cuda"
+BATCH_SIZE = 24
+MODEL = "large-v2"
 
 
 def download_models():
@@ -58,7 +62,6 @@ app_image = (
 )
 
 stub = Stub("wx", image=app_image)
-stub.running_jobs = Dict.new({})
 
 volume = NetworkFileSystem.persisted("fan-transcribe-volume")
 silence_end_re = re.compile(
@@ -217,12 +220,6 @@ def make_title(from_text: str, what: str = "conversation transcription"):
     return t
 
 
-LANGUAGE = "en"
-DEVICE = "cuda"
-BATCH_SIZE = 24
-MODEL = "large-v2"
-
-
 @stub.function(
     gpu="a10g",
     network_file_systems={CACHE_DIR: volume},
@@ -233,7 +230,7 @@ def transcribe_x(file_path: str, result_path: str, skip_align: bool = False):
     import whisperx
 
     model = whisperx.load_model(
-        "large-v2",
+        MODEL,
         device=DEVICE,
         compute_type="float16",
         language=LANGUAGE,
@@ -303,7 +300,6 @@ def start_transcribe(
     summarize=False,
     byte_string=None,
 ):
-    import whisper
     from modal import container_app
 
     model_name = cfg.model
@@ -312,10 +308,6 @@ def start_transcribe(
     job_source, job_id = cfg.identifier()
     log.info(f"Starting job {job_id}, source: {job_source}, args: {cfg}")
     # cache the model in the shared volume
-    model = all_models[model_name]
-
-    # noinspection PyProtectedMember
-    whisper._download(whisper._MODELS[model.name], str(MODEL_DIR), False)
 
     TRANSCRIPTIONS_DIR.mkdir(parents=True, exist_ok=True)
     URL_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -324,8 +316,6 @@ def start_transcribe(
         with open(URL_DOWNLOADS_DIR / cfg.filename, "wb") as file:
             file.write(b.getbuffer())
         log.info(f"Saved bytes to {URL_DOWNLOADS_DIR / cfg.filename}")
-
-    log.info(f"Using model '{model.name}' with {model.params} parameters.")
 
     result_path = TRANSCRIPTIONS_DIR / f"{job_id}.json"
     use_llm = bool(byte_string)
@@ -337,9 +327,6 @@ def start_transcribe(
                 notify_webhook(result, notify)
             return result
     else:
-        container_app.running_jobs[job_id] = RunningJob(
-            model=model.name, start_time=int(time.time()), source=job_source
-        )
         if cfg.url:
             save_file(cfg.url, URL_DOWNLOADS_DIR / job_id)
         elif cfg.video_url:
@@ -405,7 +392,6 @@ def start_transcribe(
         except Exception as e:
             log.error(e)
         finally:
-            del container_app.running_jobs[job_id]
             if byte_string:
                 log.info(f"Cleaning up cache: {URL_DOWNLOADS_DIR / cfg.filename}")
                 os.remove(URL_DOWNLOADS_DIR / cfg.filename)

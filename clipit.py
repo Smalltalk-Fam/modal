@@ -62,9 +62,9 @@ SANS_FONT_PATH = str(MNT_STATIC / "GT-Flexa-Standard-Medium.ttf")
 MONO_FONT_PATH = "/gfonts/apache/robotomono/RobotoMono[wght].ttf"
 SERIF_FONT_PATH = "/gfonts/ofl/spectral/Spectral-Medium.ttf"
 FONT_SIZE = 48
-TEXT_COLOR = (255, 255, 255, 190)
+TEXT_COLOR = (10, 10, 10, 80)
 BG_COLOR = (0, 0, 0, 0)
-HIGHLIGHT_COLOR = (231, 152, 191, 255)
+HIGHLIGHT_COLOR = (255, 190, 213, 255)
 Y_PAD = 8
 
 
@@ -161,11 +161,11 @@ def cut_video(transcript: Transcript, media_path: str, write_path: str):
     start_time = transcript[0]["start"]
     end_time = transcript[-1]["end"]
 
-    icon_size = 256
+    icon_size = 86
     icon_padding = 56
-    icon = ImageClip(str(MNT_STATIC / "logo.png"))
+    icon = ImageClip(str(MNT_STATIC / "icon.png"))
     icon = icon.resize(width=icon_size)
-    icon = icon.set_opacity(0.99)
+    icon = icon.set_opacity(0.85)
 
     clip = VideoFileClip(media_path)
     clip = clip.subclip(start_time, end_time)
@@ -186,7 +186,7 @@ def cut_video(transcript: Transcript, media_path: str, write_path: str):
     last_frame = ImageClip(last_frame_image, duration=1)
     last_frame = last_frame.set_audio(None)
 
-    bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
+    bumper = VideoFileClip(str(MNT_STATIC / "st-bumper.mp4"))
     bumper = bumper.set_audio(None)
 
     final_clip = concatenate_videoclips([clip, last_frame, bumper])
@@ -252,11 +252,11 @@ def combine_audio_video(
 
     t0 = time.time()
 
-    icon_size = 256
+    icon_size = 86
     icon_padding = 56
-    icon = ImageClip(str(MNT_STATIC / "logo.png"))
+    icon = ImageClip(str(MNT_STATIC / "icon.png"))
     icon = icon.resize(width=icon_size)
-    icon = icon.set_opacity(0.99)
+    icon = icon.set_opacity(0.85)
 
     video_clip = VideoFileClip(video_path)
     icon = icon.set_duration(video_clip.duration)
