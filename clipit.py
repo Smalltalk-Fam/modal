@@ -62,9 +62,9 @@ SANS_FONT_PATH = str(MNT_STATIC / "GT-Flexa-Standard-Medium.ttf")
 MONO_FONT_PATH = "/gfonts/apache/robotomono/RobotoMono[wght].ttf"
 SERIF_FONT_PATH = "/gfonts/ofl/spectral/Spectral-Medium.ttf"
 FONT_SIZE = 48
-TEXT_COLOR = (255, 255, 255, 225)
-BG_COLOR = (0, 0, 0, 180)
-HIGHLIGHT_COLOR = (240, 215, 10, 255)
+TEXT_COLOR = (255, 255, 255, 190)
+BG_COLOR = (0, 0, 0, 0)
+HIGHLIGHT_COLOR = (231, 152, 191, 255)
 Y_PAD = 8
 
 
@@ -161,11 +161,11 @@ def cut_video(transcript: Transcript, media_path: str, write_path: str):
     start_time = transcript[0]["start"]
     end_time = transcript[-1]["end"]
 
-    icon_size = 75
+    icon_size = 256
     icon_padding = 56
     icon = ImageClip(str(MNT_STATIC / "logo.png"))
-    icon = icon.resize(height=icon_size)
-    icon = icon.set_opacity(0.85)
+    icon = icon.resize(width=icon_size)
+    icon = icon.set_opacity(0.99)
 
     clip = VideoFileClip(media_path)
     clip = clip.subclip(start_time, end_time)
@@ -182,19 +182,14 @@ def cut_video(transcript: Transcript, media_path: str, write_path: str):
     clip = CompositeVideoClip([clip, icon])
 
     last_frame_time = clip.duration - 0.1
-    last_frame = clip.subclip(last_frame_time, clip.duration).set_duration(0.5)
+    last_frame_image = clip.get_frame(last_frame_time)
+    last_frame = ImageClip(last_frame_image, duration=1)
     last_frame = last_frame.set_audio(None)
-    last_frame = last_frame.crossfadeout(0.5)
 
-    # bumper_audio = AudioFileClip(str(MNT_STATIC / "bumper_audio.aif"))
-    #
-    # bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
-    # bumper_centered = CompositeVideoClip(
-    #     [bumper.set_position("center")], size=clip.size
-    # )
-    # bumper_centered = bumper_centered.set_audio(bumper_audio)
+    bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
+    bumper = bumper.set_audio(None)
 
-    final_clip = concatenate_videoclips([clip, last_frame])  # todo add bumper
+    final_clip = concatenate_videoclips([clip, last_frame, bumper])
     final_clip.write_videofile(write_path)
 
     log.info(f"Cut video in {time.time() - t0:.2f} seconds")
@@ -257,11 +252,11 @@ def combine_audio_video(
 
     t0 = time.time()
 
-    icon_size = 75
+    icon_size = 256
     icon_padding = 56
     icon = ImageClip(str(MNT_STATIC / "logo.png"))
-    icon = icon.resize(height=icon_size)
-    icon = icon.set_opacity(0.85)
+    icon = icon.resize(width=icon_size)
+    icon = icon.set_opacity(0.99)
 
     video_clip = VideoFileClip(video_path)
     icon = icon.set_duration(video_clip.duration)
@@ -275,17 +270,13 @@ def combine_audio_video(
     video_clip = video_clip.set_audio(audio)
 
     last_frame_time = video_clip.duration - 0.1
-    last_frame = video_clip.subclip(last_frame_time, video_clip.duration).set_duration(
-        0.5
-    )
+    last_frame_image = video_clip.get_frame(last_frame_time)
+    last_frame = ImageClip(last_frame_image, duration=1)
     last_frame = last_frame.set_audio(None)
-    last_frame = last_frame.crossfadeout(0.5)
 
-    # bumper = VideoFileClip(str(MNT_STATIC / "bumper.mp4"))
-    # bumper = bumper.crossfadein(0.5)
-    # bumper_audio = AudioFileClip(str(MNT_STATIC / "bumper_audio.aif"))
-    # bumper = bumper.set_audio(bumper_audio)
-    final_clip = concatenate_videoclips([video_clip, last_frame])  # todo add bumper
+    bumper = VideoFileClip(str(MNT_STATIC / "st-bumper.mp4"))
+    bumper = bumper.set_audio(None)
+    final_clip = concatenate_videoclips([video_clip, last_frame, bumper])
     final_clip.write_videofile(write_path)
 
     log.info(f"combined audio and video in {time.time() - t0:.2f} seconds")
@@ -316,7 +307,8 @@ def gen_clip(
     callback_url: Optional[str] = None,
 ) -> str:
     t0 = time.time()
-    transcript = get_s3_json(BUCKET, transcript_key)
+    obj = get_s3_json(BUCKET, transcript_key)
+    transcript = obj["segments"]
     selection = transcript[start_idx : end_idx + 1]
     if start_word_offset and start_word_offset > 0:
         words = selection[0]["words"][start_word_offset:]
@@ -406,8 +398,11 @@ def web(api_args: APIArgs, x_modal_secret: str = Header(default=None)):
             args = dataclasses.asdict(api_args)
             del args["sync"]
             key = gen_clip.call(**args)
+            log.info(f"Generated clip: {key}")
             return {"file_key": key}
         else:
-            call = gen_clip.spawn(**dataclasses.asdict(api_args))
+            args = dataclasses.asdict(api_args)
+            del args["sync"]
+            call = gen_clip.spawn(**args)
             return {"call_id": call.object_id}
     return {"error": "Invalid resource"}
