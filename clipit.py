@@ -277,7 +277,7 @@ def combine_audio_video(
     bumper = VideoFileClip(str(MNT_STATIC / "st-bumper.mp4"))
     bumper = bumper.set_audio(None)
     final_clip = concatenate_videoclips([video_clip, last_frame, bumper])
-    final_clip.write_videofile(write_path)
+    final_clip.write_videofile(write_path, audio_codec="aac", audio_bitrate="192k")
 
     log.info(f"combined audio and video in {time.time() - t0:.2f} seconds")
 
